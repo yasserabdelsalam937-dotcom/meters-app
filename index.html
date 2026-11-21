@@ -1882,4 +1882,1677 @@
       { id: 'm_33', order: 33, type: 'كهرباء', property: 'سبت العليا - أرض الكهرباء', location: 'سبت العليا - أرض الكهرباء', client: 'غير محدد', meterNo: 'MMF2020807520950', accountNo: '—', notes: '—' },
       { id: 'm_34', order: 34, type: 'كهرباء', property: 'سبت العليا - أرض الكهرباء', location: 'سبت العليا - أرض الكهرباء', client: 'غير محدد', meterNo: 'SMR2020725003544', accountNo: '—', notes: '—' },
       { id: 'm_35', order: 35, type: 'كهرباء', property: 'سبت العليا - أرض الكهرباء', location: 'سبت العليا - أرض الكهرباء', client: 'غير محدد', meterNo: 'ALH2020807375331', accountNo: '—', notes: '—' },
-      { id: 'm_36', order: 36, type: 'كهرباء', property: 'سبت العليا - أرض الكهرباء', location: 'سبت العليا - أرض الكهرباء', client: 'غير محدد', meterNo: 'ALH2020807375
+      { id: 'm_36', order: 36, type: 'كهرباء', property: 'سبت العليا - أرض الكهرباء', location: 'سبت العليا - أرض الكهرباء', client: 'غير محدد', meterNo: 'ALH2020807375419', accountNo: '—', notes: '—' },
+      { id: 'm_37', order: 37, type: 'كهرباء', property: 'سبت العليا - أرض الكهرباء', location: 'سبت العليا - أرض الكهرباء', client: 'غير محدد', meterNo: 'WSE2020807238236', accountNo: '—', notes: '—' },
+      { id: 'm_38', order: 38, type: 'كهرباء', property: 'عداد اليونسية', location: 'اليونسية', client: 'غير محدد', meterNo: '—', accountNo: '30166896897', notes: '—' },
+      { id: 'm_39', order: 39, type: 'مياه', property: 'عداد مياه العدل', location: 'العدل', client: 'شركة رياش', meterNo: '—', accountNo: '4800216666', notes: 'عداد مياه العدل' }
+    ];
+
+    /* =====================================================================
+       2. STATE, PRESENCE, BROADCASTCHANNEL & SAFE OPTIONAL CLOUD SYNC
+       ===================================================================== */
+    const STORAGE_KEY = 'tatbeeq_al_addadat_state_v3';
+    const SESSION_KEY = 'tatbeeq_al_addadat_session_v3';
+    const CHANNEL_NAME = 'tatbeeq_al_addadat_channel_v3';
+    const CLIENT_ID = 'client_' + Math.random().toString(36).slice(2, 10);
+    const PRESENCE_TTL_MS = 25000;
+
+    let bc = null;
+    try {
+      if ('BroadcastChannel' in window) {
+        bc = new BroadcastChannel(CHANNEL_NAME);
+      }
+    } catch (e) {
+      bc = null;
+    }
+
+    function createDefaultState() {
+      return {
+        updatedAt: Date.now(),
+        sourceClient: CLIENT_ID,
+        admin: {
+          username: 'admin',
+          password: '123456',
+          fullName: 'المدير العام'
+        },
+        cloudConfig: {
+          dbUrl: '',
+          secret: ''
+        },
+        meters: INITIAL_METERS.map(m => ({ ...m })),
+        bills: [],
+        employees: [],
+        presence: {},
+        activityLog: []
+      };
+    }
+
+    function normalizePermissions(rawPerms) {
+      const p = rawPerms || {};
+      return {
+        view: p.view !== undefined ? !!p.view : true,
+        addMeter: !!(p.addMeter ?? p.canAddMeter),
+        editMeter: !!(p.editMeter ?? p.canEditMeter),
+        deleteMeter: !!(p.deleteMeter ?? p.canDeleteMeter),
+        manageInvoices: p.manageInvoices !== undefined ? !!p.manageInvoices : !!(p.canManageBills),
+        deleteInvoice: !!(p.deleteInvoice ?? p.canDeleteBill),
+        exportData: p.exportData !== undefined ? !!p.exportData : !!(p.canExport)
+      };
+    }
+
+    let state = createDefaultState();
+    let currentUser = null;
+    let activeBillsMeterId = null;
+    let confirmCallback = null;
+    let rtdbPollTimer = null;
+    let presenceHeartbeatTimer = null;
+    let presenceTickTimer = null;
+
+    function cloneState(obj) {
+      return JSON.parse(JSON.stringify(obj));
+    }
+
+    function loadStateFromStorage() {
+      try {
+        const raw = localStorage.getItem(STORAGE_KEY);
+        if (!raw) return createDefaultState();
+        const parsed = JSON.parse(raw);
+        const def = createDefaultState();
+        return {
+          updatedAt: parsed.updatedAt || Date.now(),
+          sourceClient: parsed.sourceClient || '',
+          admin: {
+            username: (parsed.admin && parsed.admin.username) || def.admin.username,
+            password: (parsed.admin && parsed.admin.password) || def.admin.password,
+            fullName: (parsed.admin && parsed.admin.fullName) || def.admin.fullName
+          },
+          cloudConfig: {
+            dbUrl: (parsed.cloudConfig && parsed.cloudConfig.dbUrl) || '',
+            secret: (parsed.cloudConfig && parsed.cloudConfig.secret) || ''
+          },
+          meters: Array.isArray(parsed.meters) && parsed.meters.length > 0 ? parsed.meters : def.meters,
+          bills: Array.isArray(parsed.bills) ? parsed.bills : [],
+          employees: Array.isArray(parsed.employees)
+            ? parsed.employees.map(emp => ({ ...emp, permissions: normalizePermissions(emp.permissions) }))
+            : [],
+          presence: parsed.presence && typeof parsed.presence === 'object' ? parsed.presence : {},
+          activityLog: Array.isArray(parsed.activityLog) ? parsed.activityLog : []
+        };
+      } catch (e) {
+        return createDefaultState();
+      }
+    }
+
+    function recordActivity(message) {
+      try {
+        const actor = currentUser ? `${currentUser.fullName} (${currentUser.username})` : 'النظام';
+        state.activityLog.unshift({
+          id: 'log_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+          actor,
+          message,
+          timestamp: new Date().toLocaleString('ar-SA')
+        });
+        if (state.activityLog.length > 250) {
+          state.activityLog = state.activityLog.slice(0, 250);
+        }
+      } catch (e) {}
+    }
+
+    function updateCurrentUserPresence(isOnline) {
+      if (!currentUser) return;
+      try {
+        if (!state.presence || typeof state.presence !== 'object') {
+          state.presence = {};
+        }
+        const key = currentUser.role === 'admin' ? 'admin' : currentUser.id;
+        const now = Date.now();
+        state.presence[key] = {
+          userId: key,
+          username: currentUser.username,
+          fullName: currentUser.fullName,
+          role: currentUser.role,
+          online: !!isOnline,
+          lastSeen: now,
+          clientId: CLIENT_ID
+        };
+      } catch (e) {}
+    }
+
+    function getEmployeePresenceInfo(emp) {
+      if (!emp.active) {
+        return { cls: 'presence-disabled', label: 'حساب موقوف', sub: '' };
+      }
+      const p = state.presence && state.presence[emp.id];
+      const online = !!(p && p.online && (Date.now() - (p.lastSeen || 0)) <= PRESENCE_TTL_MS);
+      if (online) {
+        const t = p.lastSeen ? new Date(p.lastSeen).toLocaleTimeString('ar-SA') : '';
+        return { cls: 'presence-online', label: 'نشط الآن', sub: t ? `آخر نبضة: ${t}` : '' };
+      }
+      const lastSeenText = p && p.lastSeen ? `آخر ظهور: ${new Date(p.lastSeen).toLocaleString('ar-SA')}` : 'لم يدخل بعد';
+      return { cls: 'presence-offline', label: 'غير نشط', sub: lastSeenText };
+    }
+
+    function startPresenceHeartbeat() {
+      stopPresenceHeartbeat();
+      if (!currentUser) return;
+
+      updateCurrentUserPresence(true);
+      persistState(true);
+
+      presenceHeartbeatTimer = setInterval(() => {
+        if (!currentUser) return;
+        updateCurrentUserPresence(true);
+        persistState(true);
+        if (!document.getElementById('usersModal').classList.contains('hidden')) {
+          renderEmployeesTable();
+        }
+      }, 8000);
+
+      presenceTickTimer = setInterval(() => {
+        if (!document.getElementById('usersModal').classList.contains('hidden')) {
+          renderEmployeesTable();
+        }
+      }, 5000);
+    }
+
+    function stopPresenceHeartbeat() {
+      if (presenceHeartbeatTimer) {
+        clearInterval(presenceHeartbeatTimer);
+        presenceHeartbeatTimer = null;
+      }
+      if (presenceTickTimer) {
+        clearInterval(presenceTickTimer);
+        presenceTickTimer = null;
+      }
+    }
+
+    function persistState(syncRemote = true) {
+      state.updatedAt = Date.now();
+      state.sourceClient = CLIENT_ID;
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      } catch (e) {
+        showToast('تنبيه: مساحة التخزين المحلية ممتلئة. قلل حجم المرفقات أو صدّر نسخة احتياطية.', 'error');
+      }
+
+      try {
+        if (bc) {
+          bc.postMessage({ type: 'STATE_SYNC', payload: cloneState(state) });
+        }
+      } catch (e) {}
+
+      if (syncRemote) {
+        try {
+          pushToFirebaseRTDB(state);
+        } catch (e) {}
+      }
+    }
+
+    function applyIncomingRemoteState(incoming) {
+      if (!incoming || !Array.isArray(incoming.meters)) return;
+      if ((incoming.updatedAt || 0) <= (state.updatedAt || 0) && incoming.sourceClient === CLIENT_ID) return;
+      if ((incoming.updatedAt || 0) < (state.updatedAt || 0)) return;
+
+      const def = createDefaultState();
+      const mergedPresence = Object.assign(
+        {},
+        state.presence || {},
+        incoming.presence && typeof incoming.presence === 'object' ? incoming.presence : {}
+      );
+      if (currentUser) {
+        const myKey = currentUser.role === 'admin' ? 'admin' : currentUser.id;
+        if (state.presence && state.presence[myKey] && state.presence[myKey].online) {
+          mergedPresence[myKey] = state.presence[myKey];
+        }
+      }
+
+      state = {
+        updatedAt: incoming.updatedAt || Date.now(),
+        sourceClient: incoming.sourceClient || 'remote',
+        admin: {
+          username: (incoming.admin && incoming.admin.username) || def.admin.username,
+          password: (incoming.admin && incoming.admin.password) || def.admin.password,
+          fullName: (incoming.admin && incoming.admin.fullName) || def.admin.fullName
+        },
+        cloudConfig: {
+          dbUrl: (state.cloudConfig && state.cloudConfig.dbUrl) || (incoming.cloudConfig && incoming.cloudConfig.dbUrl) || '',
+          secret: (state.cloudConfig && state.cloudConfig.secret) || (incoming.cloudConfig && incoming.cloudConfig.secret) || ''
+        },
+        meters: incoming.meters,
+        bills: Array.isArray(incoming.bills) ? incoming.bills : [],
+        employees: Array.isArray(incoming.employees)
+          ? incoming.employees.map(emp => ({ ...emp, permissions: normalizePermissions(emp.permissions) }))
+          : [],
+        presence: mergedPresence,
+        activityLog: Array.isArray(incoming.activityLog) ? incoming.activityLog : []
+      };
+
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      } catch (e) {}
+
+      if (currentUser && currentUser.role === 'employee') {
+        const freshEmp = state.employees.find(emp => emp.id === currentUser.id);
+        if (!freshEmp || !freshEmp.active) {
+          showToast('تم إيقاف حسابك من قبل المدير.', 'error');
+          handleLogout(false);
+          return;
+        }
+        currentUser = {
+          id: freshEmp.id,
+          fullName: freshEmp.fullName,
+          username: freshEmp.username,
+          role: 'employee',
+          permissions: normalizePermissions(freshEmp.permissions)
+        };
+        try {
+          sessionStorage.setItem(SESSION_KEY, JSON.stringify(currentUser));
+        } catch (e) {}
+      }
+
+      if (currentUser) {
+        applyPermissionsToUI();
+        renderAll();
+        if (activeBillsMeterId) {
+          renderMeterBillsTable(activeBillsMeterId);
+        }
+        if (!document.getElementById('allBillsModal').classList.contains('hidden')) {
+          renderAllBillsTable();
+        }
+        if (!document.getElementById('usersModal').classList.contains('hidden')) {
+          renderEmployeesTable();
+        }
+        if (!document.getElementById('activityLogModal').classList.contains('hidden')) {
+          renderActivityLog();
+        }
+      }
+    }
+
+    function getRtdbEndpoint() {
+      try {
+        const base = ((state.cloudConfig && state.cloudConfig.dbUrl) || '').trim().replace(/\/+$/, '');
+        if (!base || !/^https?:\/\//i.test(base)) return '';
+        const secret = ((state.cloudConfig && state.cloudConfig.secret) || '').trim();
+        const url = `${base}/tatbeeq_al_addadat.json`;
+        return secret ? `${url}?auth=${encodeURIComponent(secret)}` : url;
+      } catch (e) {
+        return '';
+      }
+    }
+
+    function updateSyncStatusBadge() {
+      try {
+        const pill = document.getElementById('syncStatusPill');
+        const text = document.getElementById('syncStatusText');
+        if (!pill || !text) return;
+        const hasCloud = !!getRtdbEndpoint();
+        pill.classList.toggle('local-only', !hasCloud);
+        text.textContent = hasCloud ? 'مزامنة سحابية نشطة (Firebase RTDB)' : 'مزامنة محلية وفورية (BroadcastChannel)';
+      } catch (e) {}
+    }
+
+    async function pushToFirebaseRTDB(snapshotState) {
+      try {
+        const url = getRtdbEndpoint();
+        if (!url || typeof fetch !== 'function') return;
+        const safePayload = cloneState(snapshotState);
+        safePayload.cloudConfig = { dbUrl: '', secret: '' };
+        await fetch(url, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(safePayload)
+        });
+      } catch (e) {
+        // Isolated safely so network or cloud errors never block the app
+      }
+    }
+
+    async function pullFromFirebaseRTDB() {
+      try {
+        const url = getRtdbEndpoint();
+        if (!url || typeof fetch !== 'function') return;
+        const res = await fetch(url, { cache: 'no-store' });
+        if (!res || !res.ok) return;
+        const data = await res.json();
+        if (data && Array.isArray(data.meters)) {
+          applyIncomingRemoteState(data);
+        }
+      } catch (e) {
+        // Isolated safely
+      }
+    }
+
+    function startFirebasePolling() {
+      try {
+        if (rtdbPollTimer) {
+          clearInterval(rtdbPollTimer);
+          rtdbPollTimer = null;
+        }
+        updateSyncStatusBadge();
+        if (getRtdbEndpoint()) {
+          pullFromFirebaseRTDB();
+          rtdbPollTimer = setInterval(pullFromFirebaseRTDB, 4000);
+        }
+      } catch (e) {}
+    }
+
+    function setupLiveListeners() {
+      try {
+        if (bc) {
+          bc.onmessage = (ev) => {
+            try {
+              if (ev && ev.data && ev.data.type === 'STATE_SYNC') {
+                applyIncomingRemoteState(ev.data.payload);
+              }
+            } catch (e) {}
+          };
+        }
+      } catch (e) {}
+
+      try {
+        window.addEventListener('storage', (ev) => {
+          try {
+            if (ev.key === STORAGE_KEY && ev.newValue) {
+              const parsed = JSON.parse(ev.newValue);
+              applyIncomingRemoteState(parsed);
+            }
+          } catch (e) {}
+        });
+      } catch (e) {}
+
+      try {
+        window.addEventListener('beforeunload', () => {
+          try {
+            if (!currentUser) return;
+            updateCurrentUserPresence(false);
+            state.updatedAt = Date.now();
+            state.sourceClient = CLIENT_ID;
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+            if (bc) bc.postMessage({ type: 'STATE_SYNC', payload: cloneState(state) });
+            const url = getRtdbEndpoint();
+            if (url && typeof navigator.sendBeacon === 'function') {
+              const safePayload = cloneState(state);
+              safePayload.cloudConfig = { dbUrl: '', secret: '' };
+              navigator.sendBeacon(url, new Blob([JSON.stringify(safePayload)], { type: 'application/json' }));
+            }
+          } catch (e) {}
+        });
+      } catch (e) {}
+
+      startFirebasePolling();
+    }
+
+    /* =====================================================================
+       3. AUTHENTICATION & GRANULAR PERMISSIONS
+       ===================================================================== */
+    function togglePasswordVisibility() {
+      const inp = document.getElementById('loginPassword');
+      inp.type = inp.type === 'password' ? 'text' : 'password';
+    }
+
+    function handleLogin(e) {
+      e.preventDefault();
+      try {
+        const u = document.getElementById('loginUsername').value.trim();
+        const p = document.getElementById('loginPassword').value;
+        const errBox = document.getElementById('loginErrorBox');
+        const errText = document.getElementById('loginErrorText');
+        errBox.classList.add('hidden');
+
+        if (u.toLowerCase() === String(state.admin.username).toLowerCase() && p === String(state.admin.password)) {
+          enterWorkspace({
+            id: 'admin',
+            fullName: state.admin.fullName || 'المدير العام',
+            username: state.admin.username,
+            role: 'admin',
+            permissions: {
+              view: true,
+              addMeter: true,
+              editMeter: true,
+              deleteMeter: true,
+              manageInvoices: true,
+              deleteInvoice: true,
+              exportData: true
+            }
+          }, true);
+          return;
+        }
+
+        const emp = state.employees.find(
+          item => String(item.username).toLowerCase() === u.toLowerCase() && String(item.password) === p
+        );
+
+        if (emp) {
+          if (!emp.active) {
+            errText.textContent = 'هذا الحساب موقوف حالياً. يرجى مراجعة المدير.';
+            errBox.classList.remove('hidden');
+            return;
+          }
+          enterWorkspace({
+            id: emp.id,
+            fullName: emp.fullName,
+            username: emp.username,
+            role: 'employee',
+            permissions: normalizePermissions(emp.permissions)
+          }, true);
+          return;
+        }
+
+        errText.textContent = 'اسم المستخدم أو كلمة المرور غير صحيحة.';
+        errBox.classList.remove('hidden');
+      } catch (err) {
+        showToast('حدث خطأ أثناء تسجيل الدخول.', 'error');
+      }
+    }
+
+    function enterWorkspace(userObj, showWelcome) {
+      currentUser = userObj;
+      try {
+        sessionStorage.setItem(SESSION_KEY, JSON.stringify(userObj));
+      } catch (e) {}
+
+      document.getElementById('loginScreen').classList.add('hidden');
+      document.getElementById('appWorkspace').classList.remove('hidden');
+
+      document.getElementById('currentUserName').textContent = userObj.fullName;
+      document.getElementById('currentUserRole').textContent =
+        userObj.role === 'admin' ? 'المدير العام (صلاحيات كاملة)' : `موظف (${userObj.username}) • نشط الآن`;
+      document.getElementById('printUserText').textContent = userObj.fullName;
+
+      if (showWelcome) {
+        recordActivity(`سجّل دخول إلى التطبيق (${userObj.role === 'admin' ? 'المدير' : 'موظف'})`);
+      }
+      startPresenceHeartbeat();
+
+      applyPermissionsToUI();
+      renderAll();
+      if (showWelcome) {
+        showToast(`مرحباً بك، ${userObj.fullName}`, 'success');
+      }
+    }
+
+    function handleLogout(recordExit = true) {
+      stopPresenceHeartbeat();
+      if (recordExit && currentUser) {
+        recordActivity('سجّل خروج من التطبيق');
+        updateCurrentUserPresence(false);
+        persistState(true);
+      }
+      currentUser = null;
+      activeBillsMeterId = null;
+      try {
+        sessionStorage.removeItem(SESSION_KEY);
+      } catch (e) {}
+      document.getElementById('loginForm').reset();
+      document.getElementById('loginErrorBox').classList.add('hidden');
+      document.getElementById('appWorkspace').classList.add('hidden');
+      document.getElementById('loginScreen').classList.remove('hidden');
+    }
+
+    function hasPerm(key) {
+      if (!currentUser) return false;
+      if (currentUser.role === 'admin') return true;
+      return !!(currentUser.permissions && currentUser.permissions[key]);
+    }
+
+    function applyPermissionsToUI() {
+      const isAdmin = !!(currentUser && currentUser.role === 'admin');
+      document.getElementById('manageUsersBtn').classList.toggle('hidden', !isAdmin);
+      document.getElementById('activityLogBtn').classList.toggle('hidden', !isAdmin);
+      document.getElementById('menuCloudConfigBtn').classList.toggle('hidden', !isAdmin);
+      document.getElementById('menuChangePassBtn').classList.toggle('hidden', !isAdmin);
+      document.getElementById('menuBackupJsonBtn').classList.toggle('hidden', !isAdmin);
+      document.getElementById('menuRestoreJsonBtn').classList.toggle('hidden', !isAdmin);
+
+      document.getElementById('addMeterBtn').classList.toggle('hidden', !hasPerm('addMeter'));
+      document.getElementById('toolbarExportCsvBtn').classList.toggle('hidden', !hasPerm('exportData'));
+      document.getElementById('menuExportCsvBtn').classList.toggle('hidden', !hasPerm('exportData'));
+
+      const canModifyMeter = hasPerm('editMeter') || hasPerm('deleteMeter');
+      document.getElementById('actionsTh').classList.toggle('hidden', !canModifyMeter);
+
+      document.getElementById('addBillBox').classList.toggle('hidden', !hasPerm('manageInvoices'));
+      document.getElementById('billDeleteTh').classList.toggle('hidden', !hasPerm('deleteInvoice'));
+    }
+
+    /* =====================================================================
+       4. DASHBOARD RENDERING, COMPANY BREAKDOWN & FILTERS
+       ===================================================================== */
+    function normalizeClient(client) {
+      const trimmed = String(client || '').trim();
+      return (!trimmed || trimmed === '—' || trimmed === 'غير محدد') ? 'غير محدد' : trimmed;
+    }
+
+    function renderAll() {
+      updateKPIs();
+      populateDropdowns();
+      renderCompanyCards();
+      applyFilters();
+      document.getElementById('employeesCountBadge').textContent = state.employees.length;
+      document.getElementById('totalBillsBadge').textContent = state.bills.length;
+      document.getElementById('activityCountBadge').textContent = state.activityLog.length;
+      updateSyncStatusBadge();
+    }
+
+    function updateKPIs() {
+      const total = state.meters.length;
+      const elec = state.meters.filter(m => m.type === 'كهرباء').length;
+      const water = state.meters.filter(m => m.type === 'مياه').length;
+      const billsSum = state.bills.reduce((sum, b) => sum + (parseFloat(b.amount) || 0), 0);
+
+      document.getElementById('kpiTotalMeters').textContent = total;
+      document.getElementById('kpiElecMeters').textContent = elec;
+      document.getElementById('kpiWaterMeters').textContent = water;
+      document.getElementById('kpiBillsAmount').textContent = `${billsSum.toLocaleString('en-US', { maximumFractionDigits: 2 })} ر.س`;
+      document.getElementById('kpiBillsCount').textContent = `${state.bills.length} فاتورة مسجلة`;
+    }
+
+    function populateDropdowns() {
+      const clientSel = document.getElementById('clientFilter');
+      const allBillsClientSel = document.getElementById('allBillsClientFilter');
+      const clientsDl = document.getElementById('clientsList');
+      const locsDl = document.getElementById('locationsList');
+
+      const prevClient = clientSel.value;
+
+      const clients = [...new Set(state.meters.map(m => normalizeClient(m.client)))];
+      const locations = [...new Set(state.meters.map(m => String(m.location || '').trim()).filter(l => l && l !== '—'))];
+
+      clientSel.innerHTML = `<option value="ALL">جميع الشركات والعملاء (${clients.length})</option>` +
+        clients.map(c => `<option value="${escapeAttr(c)}">${escapeHtml(c)}</option>`).join('');
+
+      allBillsClientSel.innerHTML = `<option value="ALL">جميع الشركات والعملاء</option>` +
+        clients.map(c => `<option value="${escapeAttr(c)}">${escapeHtml(c)}</option>`).join('');
+
+      clientsDl.innerHTML = clients.filter(c => c !== 'غير محدد').map(c => `<option value="${escapeAttr(c)}"></option>`).join('');
+      locsDl.innerHTML = locations.map(l => `<option value="${escapeAttr(l)}"></option>`).join('');
+
+      if ([...clientSel.options].some(o => o.value === prevClient)) clientSel.value = prevClient;
+    }
+
+    function renderCompanyCards() {
+      const grid = document.getElementById('companyCardsGrid');
+      const selectedClient = document.getElementById('clientFilter').value;
+      const map = {};
+
+      state.meters.forEach(m => {
+        const cName = normalizeClient(m.client);
+        if (!map[cName]) {
+          map[cName] = { name: cName, total: 0, elec: 0, water: 0, billsSum: 0 };
+        }
+        map[cName].total += 1;
+        if (m.type === 'كهرباء') map[cName].elec += 1;
+        if (m.type === 'مياه') map[cName].water += 1;
+
+        const mBills = state.bills.filter(b => b.meterId === m.id);
+        map[cName].billsSum += mBills.reduce((s, b) => s + (parseFloat(b.amount) || 0), 0);
+      });
+
+      const list = Object.values(map).sort((a, b) => {
+        if (a.name === 'غير محدد') return 1;
+        if (b.name === 'غير محدد') return -1;
+        return b.total - a.total;
+      });
+
+      document.getElementById('companiesBadge').textContent = list.length;
+      document.getElementById('clearCompanyBtn').classList.toggle('hidden', selectedClient === 'ALL');
+
+      grid.innerHTML = list.map(item => {
+        const isActive = selectedClient === item.name;
+        return `
+          <div class="company-card ${isActive ? 'active' : ''}" onclick="selectCompany('${escapeAttr(item.name)}')">
+            <div class="company-top">
+              <div>
+                <div class="company-name">${escapeHtml(item.name)}</div>
+                <div class="company-meta">
+                  <span>⚡ ${item.elec} كهرباء</span>
+                  ${item.water > 0 ? `<span style="color:var(--sky); font-weight:700;">💧 ${item.water} مياه</span>` : ''}
+                </div>
+              </div>
+              <div class="company-total">${item.total}</div>
+            </div>
+            <div class="company-foot">
+              <span>إجمالي الفواتير</span>
+              <strong>${item.billsSum.toLocaleString('en-US', { maximumFractionDigits: 2 })} ر.س</strong>
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    function selectCompany(name) {
+      const sel = document.getElementById('clientFilter');
+      sel.value = sel.value === name ? 'ALL' : name;
+      renderCompanyCards();
+      applyFilters();
+    }
+
+    function toggleTypeFilter(type) {
+      const sel = document.getElementById('typeFilter');
+      sel.value = sel.value === type ? 'ALL' : type;
+      applyFilters();
+    }
+
+    function resetAllFilters() {
+      document.getElementById('searchInput').value = '';
+      document.getElementById('clientFilter').value = 'ALL';
+      document.getElementById('typeFilter').value = 'ALL';
+      document.getElementById('statusFilter').value = 'ALL';
+      renderCompanyCards();
+      applyFilters();
+    }
+
+    function getFilteredMeters() {
+      const q = document.getElementById('searchInput').value.trim().toLowerCase();
+      const client = document.getElementById('clientFilter').value;
+      const type = document.getElementById('typeFilter').value;
+      const status = document.getElementById('statusFilter').value;
+
+      return state.meters.filter(m => {
+        const mClient = normalizeClient(m.client);
+        if (client !== 'ALL' && mClient !== client) return false;
+        if (type !== 'ALL' && m.type !== type) return false;
+
+        if (status !== 'ALL') {
+          const mBills = state.bills.filter(b => b.meterId === m.id);
+          if (status === 'HAS_BILLS' && mBills.length === 0) return false;
+          if (status === 'NO_BILLS' && mBills.length > 0) return false;
+          if (status === 'UNPAID' && !mBills.some(b => b.status === 'غير مدفوعة')) return false;
+          if (status === 'PAID' && (mBills.length === 0 || mBills.some(b => b.status !== 'مدفوعة'))) return false;
+        }
+
+        if (q) {
+          const hay = `${m.property} ${m.location} ${mClient} ${m.meterNo} ${m.accountNo} ${m.notes}`.toLowerCase();
+          if (!hay.includes(q)) return false;
+        }
+        return true;
+      });
+    }
+
+    function getClientBadgeClass(clientName) {
+      if (clientName.includes('رياش')) return 'badge-riyash';
+      if (clientName.includes('لاحم')) return 'badge-lahem';
+      if (clientName.includes('القرني')) return 'badge-qarni';
+      if (clientName === 'غير محدد') return 'badge-client';
+      return 'badge-custom-client';
+    }
+
+    function applyFilters() {
+      const filtered = getFilteredMeters();
+      const tbody = document.getElementById('metersTableBody');
+      const emptyBox = document.getElementById('emptyMetersBox');
+
+      document.getElementById('visibleMetersCount').textContent = filtered.length;
+      document.getElementById('allMetersCount').textContent = state.meters.length;
+
+      const client = document.getElementById('clientFilter').value;
+      const type = document.getElementById('typeFilter').value;
+      const status = document.getElementById('statusFilter').value;
+      const statusLabels = {
+        HAS_BILLS: 'لديها فواتير',
+        NO_BILLS: 'بدون فواتير',
+        UNPAID: 'غير مدفوعة',
+        PAID: 'مدفوعة بالكامل'
+      };
+
+      const tags = [];
+      if (client !== 'ALL') tags.push(`الشركة: ${client}`);
+      if (type !== 'ALL') tags.push(`النوع: ${type}`);
+      if (status !== 'ALL') tags.push(`الحالة: ${statusLabels[status] || status}`);
+
+      const chip = document.getElementById('activeFilterChip');
+      if (tags.length > 0) {
+        chip.textContent = tags.join(' | ');
+        chip.classList.remove('hidden');
+      } else {
+        chip.classList.add('hidden');
+      }
+
+      if (filtered.length === 0) {
+        tbody.innerHTML = '';
+        emptyBox.classList.remove('hidden');
+        return;
+      }
+
+      emptyBox.classList.add('hidden');
+      const canEdit = hasPerm('editMeter');
+      const canDelete = hasPerm('deleteMeter');
+      const showActions = canEdit || canDelete;
+
+      tbody.innerHTML = filtered.map((m, idx) => {
+        const cName = normalizeClient(m.client);
+        const isWater = m.type === 'مياه';
+        const billCount = state.bills.filter(b => b.meterId === m.id).length;
+        const hasMeterNo = m.meterNo && m.meterNo !== '—';
+        const hasAccountNo = m.accountNo && m.accountNo !== '—';
+
+        return `
+          <tr class="${isWater ? 'water-row' : ''}">
+            <td style="text-align:center; font-weight:700; color:var(--text-muted);">${idx + 1}</td>
+            <td style="text-align:center;">
+              <span class="badge ${isWater ? 'badge-water' : 'badge-elec'}">${isWater ? '💧 مياه' : '⚡ كهرباء'}</span>
+            </td>
+            <td style="font-weight:700;">${escapeHtml(m.property)}</td>
+            <td>${escapeHtml(m.location || '—')}</td>
+            <td><span class="badge ${getClientBadgeClass(cName)}">${escapeHtml(cName)}</span></td>
+            <td>
+              <div class="code-cell ltr mono">
+                <span>${escapeHtml(m.meterNo || '—')}</span>
+                ${hasMeterNo ? `<button type="button" class="copy-mini no-print" onclick="copyValue('${escapeAttr(m.meterNo)}')" title="نسخ">📋</button>` : ''}
+              </div>
+            </td>
+            <td>
+              <div class="code-cell ltr mono" style="font-weight:700;">
+                <span>${escapeHtml(m.accountNo || '—')}</span>
+                ${hasAccountNo ? `<button type="button" class="copy-mini no-print" onclick="copyValue('${escapeAttr(m.accountNo)}')" title="نسخ">📋</button>` : ''}
+              </div>
+            </td>
+            <td style="color:var(--text-muted); font-size:12px;">${escapeHtml(m.notes || '—')}</td>
+            <td class="no-print" style="text-align:center;">
+              <button type="button" class="btn ${billCount > 0 ? 'btn-soft-emerald' : 'btn-light'} btn-sm" onclick="openMeterBillsModal('${escapeAttr(m.id)}')">
+                <span>الفواتير (${billCount})</span>
+              </button>
+            </td>
+            <td class="no-print ${showActions ? '' : 'hidden'}" style="text-align:center;">
+              <div style="display:inline-flex; gap:5px;">
+                ${canEdit ? `<button type="button" class="btn btn-light btn-icon" onclick="openMeterModal('${escapeAttr(m.id)}')" title="تعديل">✏️</button>` : ''}
+                ${canDelete ? `<button type="button" class="btn btn-soft-rose btn-icon" onclick="askDeleteMeter('${escapeAttr(m.id)}')" title="حذف">🗑️</button>` : ''}
+              </div>
+            </td>
+          </tr>
+        `;
+      }).join('');
+    }
+
+    /* =====================================================================
+       5. METERS CRUD
+       ===================================================================== */
+    function openMeterModal(meterId = null) {
+      if (meterId && !hasPerm('editMeter')) return;
+      if (!meterId && !hasPerm('addMeter')) return;
+
+      document.getElementById('meterForm').reset();
+      if (meterId) {
+        const m = state.meters.find(item => item.id === meterId);
+        if (!m) return;
+        document.getElementById('meterModalTitle').textContent = 'تعديل بيانات العداد';
+        document.getElementById('editMeterId').value = m.id;
+        document.getElementById('meterTypeInput').value = m.type;
+        document.getElementById('meterClientInput').value = m.client === 'غير محدد' ? '' : m.client;
+        document.getElementById('meterPropertyInput').value = m.property;
+        document.getElementById('meterLocationInput').value = m.location === '—' ? '' : m.location;
+        document.getElementById('meterNumberInput').value = m.meterNo === '—' ? '' : m.meterNo;
+        document.getElementById('meterAccountInput').value = m.accountNo === '—' ? '' : m.accountNo;
+        document.getElementById('meterNotesInput').value = m.notes === '—' ? '' : (m.notes || '');
+      } else {
+        document.getElementById('meterModalTitle').textContent = 'إضافة عداد جديد';
+        document.getElementById('editMeterId').value = '';
+      }
+      document.getElementById('meterModal').classList.remove('hidden');
+    }
+
+    function closeMeterModal() {
+      document.getElementById('meterModal').classList.add('hidden');
+    }
+
+    function saveMeter(e) {
+      e.preventDefault();
+      const editId = document.getElementById('editMeterId').value;
+      if (editId && !hasPerm('editMeter')) return;
+      if (!editId && !hasPerm('addMeter')) return;
+
+      const type = document.getElementById('meterTypeInput').value;
+      const client = normalizeClient(document.getElementById('meterClientInput').value);
+      const property = document.getElementById('meterPropertyInput').value.trim();
+      const location = document.getElementById('meterLocationInput').value.trim() || '—';
+      const meterNo = document.getElementById('meterNumberInput').value.trim() || '—';
+      const accountNo = document.getElementById('meterAccountInput').value.trim() || '—';
+      const notes = document.getElementById('meterNotesInput').value.trim() || '—';
+
+      if (editId) {
+        const idx = state.meters.findIndex(m => m.id === editId);
+        if (idx !== -1) {
+          state.meters[idx] = { ...state.meters[idx], type, client, property, location, meterNo, accountNo, notes };
+        }
+        recordActivity(`عدّل بيانات العداد "${property}" (${client})`);
+        showToast('تم تحديث بيانات العداد ومزامنتها.', 'success');
+      } else {
+        const maxOrder = state.meters.reduce((mx, m) => Math.max(mx, m.order || 0), 0);
+        state.meters.push({
+          id: 'm_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+          order: maxOrder + 1,
+          type,
+          client,
+          property,
+          location,
+          meterNo,
+          accountNo,
+          notes
+        });
+        recordActivity(`أضاف عداد ${type} جديد: "${property}" (${client})`);
+        showToast('تم إضافة العداد الجديد بنجاح.', 'success');
+      }
+
+      persistState(true);
+      closeMeterModal();
+      renderAll();
+    }
+
+    function askDeleteMeter(meterId) {
+      if (!hasPerm('deleteMeter')) return;
+      const m = state.meters.find(item => item.id === meterId);
+      if (!m) return;
+
+      openConfirm(
+        'حذف العداد',
+        `هل أنت متأكد من حذف عداد "${m.property}" وجميع الفواتير المرتبطة به؟`,
+        () => {
+          state.meters = state.meters.filter(item => item.id !== meterId);
+          state.bills = state.bills.filter(b => b.meterId !== meterId);
+          recordActivity(`حذف العداد "${m.property}"`);
+          persistState(true);
+          renderAll();
+          showToast('تم حذف العداد.', 'info');
+        }
+      );
+    }
+
+    /* =====================================================================
+       6. MONTHLY INVOICES, ATTACHMENTS & PAYMENT STATUS
+       ===================================================================== */
+    function openMeterBillsModal(meterId) {
+      const m = state.meters.find(item => item.id === meterId);
+      if (!m) return;
+      activeBillsMeterId = meterId;
+      document.getElementById('billMeterId').value = meterId;
+      document.getElementById('billsModalTitle').textContent = `فواتير: ${m.property}`;
+      document.getElementById('billsModalSubtitle').textContent =
+        `الشركة: ${normalizeClient(m.client)} | رقم العداد: ${m.meterNo} | رقم الحساب: ${m.accountNo}`;
+
+      const months = [
+        'يناير (01)', 'فبراير (02)', 'مارس (03)', 'أبريل (04)',
+        'مايو (05)', 'يونيو (06)', 'يوليو (07)', 'أغسطس (08)',
+        'سبتمبر (09)', 'أكتوبر (10)', 'نوفمبر (11)', 'ديسمبر (12)'
+      ];
+      document.getElementById('billMonth').value = months[new Date().getMonth()];
+
+      applyPermissionsToUI();
+      renderMeterBillsTable(meterId);
+      document.getElementById('meterBillsModal').classList.remove('hidden');
+    }
+
+    function closeMeterBillsModal() {
+      activeBillsMeterId = null;
+      document.getElementById('meterBillsModal').classList.add('hidden');
+    }
+
+    function compressImageDataUrl(dataUrl, maxDim = 960, quality = 0.65) {
+      return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => {
+          try {
+            let w = img.width;
+            let h = img.height;
+            if (w > maxDim || h > maxDim) {
+              if (w >= h) {
+                h = Math.round((h * maxDim) / w);
+                w = maxDim;
+              } else {
+                w = Math.round((w * maxDim) / h);
+                h = maxDim;
+              }
+            }
+            const canvas = document.createElement('canvas');
+            canvas.width = w;
+            canvas.height = h;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(img, 0, 0, w, h);
+            resolve(canvas.toDataURL('image/jpeg', quality));
+          } catch (err) {
+            reject(err);
+          }
+        };
+        img.onerror = reject;
+        img.src = dataUrl;
+      });
+    }
+
+    function readFileAsDataUrl(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+      });
+    }
+
+    async function saveBill(e) {
+      e.preventDefault();
+      if (!hasPerm('manageInvoices')) return;
+
+      try {
+        const meterId = document.getElementById('billMeterId').value;
+        const meterObj = state.meters.find(item => item.id === meterId);
+        const month = document.getElementById('billMonth').value;
+        const year = document.getElementById('billYear').value;
+        const amount = parseFloat(document.getElementById('billAmount').value) || 0;
+        const status = document.getElementById('billStatus').value;
+        const note = document.getElementById('billNote').value.trim();
+        const fileInput = document.getElementById('billFile');
+
+        let fileData = null;
+        let fileName = '';
+        let fileType = '';
+
+        if (fileInput.files && fileInput.files[0]) {
+          const file = fileInput.files[0];
+          fileName = file.name;
+          fileType = file.type || 'application/octet-stream';
+          const rawUrl = await readFileAsDataUrl(file);
+
+          if (fileType.startsWith('image/')) {
+            fileData = await compressImageDataUrl(rawUrl, 960, 0.65);
+            fileType = 'image/jpeg';
+          } else {
+            if (rawUrl.length > 1400000) {
+              showToast('حجم ملف PDF كبير جداً للتخزين المحلي. يُنصح برفع صورة أو ملف أصغر.', 'error');
+              return;
+            }
+            fileData = rawUrl;
+          }
+        }
+
+        state.bills.unshift({
+          id: 'b_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+          meterId,
+          month,
+          year,
+          amount,
+          status,
+          note,
+          fileData,
+          fileName,
+          fileType,
+          addedBy: currentUser ? currentUser.fullName : 'مستخدم',
+          createdAt: Date.now()
+        });
+
+        recordActivity(`أضاف فاتورة (${month} ${year}) بقيمة ${amount} ر.س لعداد "${meterObj ? meterObj.property : meterId}" (${status})`);
+        persistState(true);
+        document.getElementById('billAmount').value = '';
+        document.getElementById('billNote').value = '';
+        fileInput.value = '';
+
+        renderMeterBillsTable(meterId);
+        renderAll();
+        showToast('تم حفظ الفاتورة ومزامنتها.', 'success');
+      } catch (err) {
+        showToast('تعذر حفظ الفاتورة أو معالجة المرفق.', 'error');
+      }
+    }
+
+    function renderMeterBillsTable(meterId) {
+      const tbody = document.getElementById('meterBillsTableBody');
+      const list = state.bills.filter(b => b.meterId === meterId);
+      const sum = list.reduce((s, b) => s + (parseFloat(b.amount) || 0), 0);
+      const canDel = hasPerm('deleteInvoice');
+      const canManage = hasPerm('manageInvoices');
+
+      document.getElementById('meterBillsTotalPill').textContent =
+        `الإجمالي: ${sum.toLocaleString('en-US', { maximumFractionDigits: 2 })} ر.س`;
+
+      if (list.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="7" style="text-align:center; padding:24px; color:var(--text-muted);">لا توجد فواتير مسجلة لهذا العداد بعد.</td></tr>`;
+        return;
+      }
+
+      tbody.innerHTML = list.map(b => `
+        <tr>
+          <td style="font-weight:700;">${escapeHtml(b.month)} — ${escapeHtml(b.year)}</td>
+          <td style="font-weight:800; color:var(--brand-dark);">${parseFloat(b.amount).toLocaleString('en-US')} ر.س</td>
+          <td>
+            <span class="badge ${b.status === 'مدفوعة' ? 'badge-riyash' : 'badge-elec'}" style="${canManage ? 'cursor:pointer;' : ''}" onclick="toggleBillStatus('${escapeAttr(b.id)}')" title="تبديل حالة السداد">
+              ${escapeHtml(b.status)}
+            </span>
+          </td>
+          <td>
+            ${b.fileData ? `<button type="button" class="btn btn-light btn-sm" onclick="previewBillFile('${escapeAttr(b.id)}')">معاينة / تحميل</button>` : '<span style="color:var(--text-muted); font-size:12px;">بدون مرفق</span>'}
+          </td>
+          <td style="font-size:12px;">${escapeHtml(b.addedBy || '—')}</td>
+          <td style="font-size:12px; color:var(--text-muted);">${escapeHtml(b.note || '—')}</td>
+          <td class="${canDel ? '' : 'hidden'}" style="text-align:center;">
+            <button type="button" class="btn btn-soft-rose btn-icon" onclick="deleteBill('${escapeAttr(b.id)}')">🗑️</button>
+          </td>
+        </tr>
+      `).join('');
+    }
+
+    function toggleBillStatus(billId) {
+      if (!hasPerm('manageInvoices')) return;
+      const b = state.bills.find(item => item.id === billId);
+      if (!b) return;
+      b.status = b.status === 'مدفوعة' ? 'غير مدفوعة' : 'مدفوعة';
+      const m = state.meters.find(item => item.id === b.meterId);
+      recordActivity(`غيّر حالة سداد فاتورة (${b.month} ${b.year}) لعداد "${m ? m.property : b.meterId}" إلى "${b.status}"`);
+      persistState(true);
+      if (activeBillsMeterId) renderMeterBillsTable(activeBillsMeterId);
+      if (!document.getElementById('allBillsModal').classList.contains('hidden')) renderAllBillsTable();
+      renderAll();
+    }
+
+    function deleteBill(billId) {
+      if (!hasPerm('deleteInvoice')) return;
+      const b = state.bills.find(item => item.id === billId);
+      if (!b) return;
+      openConfirm('حذف الفاتورة', 'هل تريد حذف هذه الفاتورة نهائياً؟', () => {
+        state.bills = state.bills.filter(item => item.id !== billId);
+        recordActivity(`حذف فاتورة (${b.month} ${b.year}) بقيمة ${b.amount} ر.س`);
+        persistState(true);
+        if (activeBillsMeterId) renderMeterBillsTable(activeBillsMeterId);
+        if (!document.getElementById('allBillsModal').classList.contains('hidden')) renderAllBillsTable();
+        renderAll();
+        showToast('تم حذف الفاتورة.', 'info');
+      });
+    }
+
+    function openAllBillsModal() {
+      populateDropdowns();
+      renderAllBillsTable();
+      document.getElementById('allBillsModal').classList.remove('hidden');
+    }
+
+    function closeAllBillsModal() {
+      document.getElementById('allBillsModal').classList.add('hidden');
+    }
+
+    function renderAllBillsTable() {
+      const cFilter = document.getElementById('allBillsClientFilter').value;
+      const mFilter = document.getElementById('allBillsMonthFilter').value;
+      const sFilter = document.getElementById('allBillsStatusFilter').value;
+      const tbody = document.getElementById('allBillsTableBody');
+
+      const rows = state.bills.map(b => {
+        const m = state.meters.find(item => item.id === b.meterId) || {
+          property: 'عداد محذوف',
+          client: 'غير محدد',
+          accountNo: '—'
+        };
+        return { bill: b, meter: m, clientName: normalizeClient(m.client) };
+      }).filter(row => {
+        if (cFilter !== 'ALL' && row.clientName !== cFilter) return false;
+        if (mFilter !== 'ALL' && row.bill.month !== mFilter) return false;
+        if (sFilter !== 'ALL' && row.bill.status !== sFilter) return false;
+        return true;
+      });
+
+      const total = rows.reduce((s, r) => s + (parseFloat(r.bill.amount) || 0), 0);
+      document.getElementById('allBillsFilteredSum').textContent = total.toLocaleString('en-US', { maximumFractionDigits: 2 });
+
+      if (rows.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="7" style="text-align:center; padding:24px; color:var(--text-muted);">لا توجد فواتير مطابقة.</td></tr>`;
+        return;
+      }
+
+      tbody.innerHTML = rows.map(r => `
+        <tr>
+          <td style="font-weight:700;">${escapeHtml(r.meter.property)}</td>
+          <td>${escapeHtml(r.clientName)}</td>
+          <td class="ltr mono">${escapeHtml(r.meter.accountNo || '—')}</td>
+          <td>${escapeHtml(r.bill.month)} — ${escapeHtml(r.bill.year)}</td>
+          <td style="font-weight:800;">${parseFloat(r.bill.amount).toLocaleString('en-US')} ر.س</td>
+          <td><span class="badge ${r.bill.status === 'مدفوعة' ? 'badge-riyash' : 'badge-elec'}">${escapeHtml(r.bill.status)}</span></td>
+          <td>${r.bill.fileData ? `<button type="button" class="btn btn-light btn-sm" onclick="previewBillFile('${escapeAttr(r.bill.id)}')">معاينة</button>` : '—'}</td>
+        </tr>
+      `).join('');
+    }
+
+    function previewBillFile(billId) {
+      const b = state.bills.find(item => item.id === billId);
+      if (!b || !b.fileData) return;
+
+      document.getElementById('previewTitle').textContent = `مرفق فاتورة ${b.month} ${b.year}`;
+      const dl = document.getElementById('downloadAttachmentLink');
+      dl.href = b.fileData;
+      dl.download = b.fileName || `bill_${b.year}_${b.id}`;
+
+      const body = document.getElementById('previewBody');
+      if (String(b.fileType).includes('pdf')) {
+        body.innerHTML = `<iframe src="${b.fileData}" style="width:100%; height:65vh; border:1px solid #cbd5e1; border-radius:10px;"></iframe>`;
+      } else {
+        body.innerHTML = `<img src="${b.fileData}" alt="مرفق الفاتورة" style="max-width:100%; max-height:65vh; border-radius:10px; box-shadow:0 6px 18px rgba(0,0,0,0.12);" />`;
+      }
+      document.getElementById('previewModal').classList.remove('hidden');
+    }
+
+    function closePreviewModal() {
+      document.getElementById('previewModal').classList.add('hidden');
+    }
+
+    /* =====================================================================
+       7. ADMIN EMPLOYEES, GRANULAR PERMISSIONS & LIVE PRESENCE
+       ===================================================================== */
+    function openUsersModal() {
+      if (!currentUser || currentUser.role !== 'admin') return;
+      resetEmployeeForm();
+      renderEmployeesTable();
+      document.getElementById('usersModal').classList.remove('hidden');
+    }
+
+    function closeUsersModal() {
+      document.getElementById('usersModal').classList.add('hidden');
+    }
+
+    function toggleAllPermCheckboxes(checked) {
+      document.querySelectorAll('.perm-cb').forEach(cb => { cb.checked = checked; });
+    }
+
+    function resetEmployeeForm() {
+      document.getElementById('employeeForm').reset();
+      document.getElementById('editEmpId').value = '';
+      document.getElementById('empFormHeading').textContent = 'إضافة موظف جديد وتحديد الصلاحيات';
+      document.getElementById('cancelEditEmpBtn').classList.add('hidden');
+      document.getElementById('perm_view').checked = true;
+      document.getElementById('perm_manageInvoices').checked = true;
+      document.getElementById('perm_exportData').checked = true;
+    }
+
+    function saveEmployee(e) {
+      e.preventDefault();
+      if (!currentUser || currentUser.role !== 'admin') return;
+
+      const editId = document.getElementById('editEmpId').value;
+      const fullName = document.getElementById('empFullName').value.trim();
+      const username = document.getElementById('empUsername').value.trim();
+      const password = document.getElementById('empPassword').value;
+      const active = document.getElementById('empActive').value === 'true';
+
+      if (username.toLowerCase() === String(state.admin.username).toLowerCase()) {
+        showToast('لا يمكن استخدام اسم مستخدم المدير لحساب موظف.', 'error');
+        return;
+      }
+
+      const dup = state.employees.find(emp => String(emp.username).toLowerCase() === username.toLowerCase() && emp.id !== editId);
+      if (dup) {
+        showToast('اسم المستخدم مستخدم بالفعل.', 'error');
+        return;
+      }
+
+      const permissions = {
+        view: document.getElementById('perm_view').checked,
+        addMeter: document.getElementById('perm_addMeter').checked,
+        editMeter: document.getElementById('perm_editMeter').checked,
+        deleteMeter: document.getElementById('perm_deleteMeter').checked,
+        manageInvoices: document.getElementById('perm_manageInvoices').checked,
+        deleteInvoice: document.getElementById('perm_deleteInvoice').checked,
+        exportData: document.getElementById('perm_exportData').checked
+      };
+
+      if (editId) {
+        const idx = state.employees.findIndex(emp => emp.id === editId);
+        if (idx !== -1) {
+          state.employees[idx] = { ...state.employees[idx], fullName, username, password, active, permissions };
+        }
+        recordActivity(`حدّث حساب وصلاحيات الموظف "${fullName}" (${username})`);
+        showToast('تم تحديث بيانات وصلاحيات الموظف.', 'success');
+      } else {
+        state.employees.push({
+          id: 'emp_' + Date.now() + '_' + Math.random().toString(36).slice(2, 5),
+          fullName,
+          username,
+          password,
+          active,
+          permissions
+        });
+        recordActivity(`أنشأ حساب موظف جديد: "${fullName}" (${username})`);
+        showToast('تم إنشاء حساب الموظف بنجاح.', 'success');
+      }
+
+      persistState(true);
+      resetEmployeeForm();
+      renderEmployeesTable();
+      document.getElementById('employeesCountBadge').textContent = state.employees.length;
+      document.getElementById('activityCountBadge').textContent = state.activityLog.length;
+    }
+
+    function editEmployee(empId) {
+      const emp = state.employees.find(item => item.id === empId);
+      if (!emp) return;
+      document.getElementById('editEmpId').value = emp.id;
+      document.getElementById('empFullName').value = emp.fullName;
+      document.getElementById('empUsername').value = emp.username;
+      document.getElementById('empPassword').value = emp.password;
+      document.getElementById('empActive').value = emp.active ? 'true' : 'false';
+
+      const p = normalizePermissions(emp.permissions);
+      document.getElementById('perm_view').checked = p.view;
+      document.getElementById('perm_addMeter').checked = p.addMeter;
+      document.getElementById('perm_editMeter').checked = p.editMeter;
+      document.getElementById('perm_deleteMeter').checked = p.deleteMeter;
+      document.getElementById('perm_manageInvoices').checked = p.manageInvoices;
+      document.getElementById('perm_deleteInvoice').checked = p.deleteInvoice;
+      document.getElementById('perm_exportData').checked = p.exportData;
+
+      document.getElementById('empFormHeading').textContent = `تعديل الموظف: ${emp.fullName}`;
+      document.getElementById('cancelEditEmpBtn').classList.remove('hidden');
+    }
+
+    function deleteEmployee(empId) {
+      const emp = state.employees.find(item => item.id === empId);
+      if (!emp) return;
+      openConfirm('حذف حساب الموظف', `هل تريد حذف حساب الموظف "${emp.fullName}"؟`, () => {
+        state.employees = state.employees.filter(item => item.id !== empId);
+        recordActivity(`حذف حساب الموظف "${emp.fullName}"`);
+        persistState(true);
+        renderEmployeesTable();
+        document.getElementById('employeesCountBadge').textContent = state.employees.length;
+        document.getElementById('activityCountBadge').textContent = state.activityLog.length;
+        showToast('تم حذف حساب الموظف.', 'info');
+      });
+    }
+
+    function renderEmployeesTable() {
+      const tbody = document.getElementById('employeesTableBody');
+      if (state.employees.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="7" style="text-align:center; padding:24px; color:var(--text-muted);">لا يوجد موظفون مسجلون حالياً.</td></tr>`;
+        return;
+      }
+
+      tbody.innerHTML = state.employees.map(emp => {
+        const p = normalizePermissions(emp.permissions);
+        const pres = getEmployeePresenceInfo(emp);
+        const labels = [];
+        if (p.view) labels.push('عرض');
+        if (p.addMeter) labels.push('إضافة عداد');
+        if (p.editMeter) labels.push('تعديل عداد');
+        if (p.deleteMeter) labels.push('حذف عداد');
+        if (p.manageInvoices) labels.push('فواتير وسداد');
+        if (p.deleteInvoice) labels.push('حذف فاتورة');
+        if (p.exportData) labels.push('تصدير Excel');
+
+        return `
+          <tr>
+            <td style="font-weight:700;">${escapeHtml(emp.fullName)}</td>
+            <td class="ltr mono">${escapeHtml(emp.username)}</td>
+            <td class="ltr mono">${escapeHtml(emp.password)}</td>
+            <td><span class="badge ${emp.active ? 'badge-riyash' : 'badge-elec'}">${emp.active ? 'مفعّل' : 'موقوف'}</span></td>
+            <td>
+              <span class="presence-badge ${pres.cls}">${escapeHtml(pres.label)}</span>
+              ${pres.sub ? `<div style="font-size:10.5px; color:var(--text-muted); margin-top:3px;">${escapeHtml(pres.sub)}</div>` : ''}
+            </td>
+            <td style="font-size:11.5px; color:#334155;">${escapeHtml(labels.length ? labels.join(' • ') : 'بدون صلاحيات')}</td>
+            <td style="text-align:center;">
+              <div style="display:inline-flex; gap:5px;">
+                <button type="button" class="btn btn-light btn-icon" onclick="editEmployee('${escapeAttr(emp.id)}')" title="تعديل">✏️</button>
+                <button type="button" class="btn btn-soft-rose btn-icon" onclick="deleteEmployee('${escapeAttr(emp.id)}')" title="حذف">🗑️</button>
+              </div>
+            </td>
+          </tr>
+        `;
+      }).join('');
+    }
+
+    /* =====================================================================
+       8. ACTIVITY LOG (ADMIN)
+       ===================================================================== */
+    function openActivityLogModal() {
+      if (!currentUser || currentUser.role !== 'admin') return;
+      renderActivityLog();
+      document.getElementById('activityLogModal').classList.remove('hidden');
+    }
+
+    function closeActivityLogModal() {
+      document.getElementById('activityLogModal').classList.add('hidden');
+    }
+
+    function renderActivityLog() {
+      const box = document.getElementById('activityLogList');
+      if (!state.activityLog || state.activityLog.length === 0) {
+        box.innerHTML = `<div style="padding:28px; text-align:center; color:var(--text-muted); font-size:13px;">لا توجد نشاطات مسجلة حتى الآن.</div>`;
+        return;
+      }
+
+      box.innerHTML = state.activityLog.map(item => `
+        <div class="log-item">
+          <div>
+            <strong style="color:var(--text-main);">${escapeHtml(item.actor)}:</strong>
+            <span style="color:#334155;">${escapeHtml(item.message)}</span>
+          </div>
+          <div class="log-time">${escapeHtml(item.timestamp)}</div>
+        </div>
+      `).join('');
+    }
+
+    function clearActivityLog() {
+      if (!currentUser || currentUser.role !== 'admin') return;
+      openConfirm('مسح سجل النشاطات', 'هل تريد مسح جميع السجلات السابقة؟', () => {
+        state.activityLog = [];
+        persistState(true);
+        renderActivityLog();
+        document.getElementById('activityCountBadge').textContent = '0';
+        showToast('تم مسح سجل النشاطات.', 'info');
+      });
+    }
+
+    /* =====================================================================
+       9. ADMIN CREDENTIALS, CLOUD CONFIG, CSV EXPORT, JSON & PRINT
+       ===================================================================== */
+    function toggleToolsMenu(e) {
+      e.stopPropagation();
+      document.getElementById('toolsMenu').classList.toggle('hidden');
+    }
+
+    document.addEventListener('click', (e) => {
+      const dd = document.getElementById('toolsDropdown');
+      const menu = document.getElementById('toolsMenu');
+      if (dd && menu && !dd.contains(e.target)) {
+        menu.classList.add('hidden');
+      }
+    });
+
+    function openChangeAdminPassModal() {
+      document.getElementById('toolsMenu').classList.add('hidden');
+      document.getElementById('adminNewUser').value = state.admin.username;
+      document.getElementById('adminNewPass').value = state.admin.password;
+      document.getElementById('adminPassModal').classList.remove('hidden');
+    }
+
+    function closeChangeAdminPassModal() {
+      document.getElementById('adminPassModal').classList.add('hidden');
+    }
+
+    function saveAdminCredentials(e) {
+      e.preventDefault();
+      if (!currentUser || currentUser.role !== 'admin') return;
+      const u = document.getElementById('adminNewUser').value.trim();
+      const p = document.getElementById('adminNewPass').value;
+      if (!u || !p) return;
+
+      state.admin.username = u;
+      state.admin.password = p;
+      currentUser.username = u;
+      try {
+        sessionStorage.setItem(SESSION_KEY, JSON.stringify(currentUser));
+      } catch (err) {}
+
+      recordActivity('حدّث بيانات دخول المدير');
+      persistState(true);
+      closeChangeAdminPassModal();
+      showToast('تم تحديث بيانات دخول المدير.', 'success');
+    }
+
+    function openCloudConfigModal() {
+      document.getElementById('toolsMenu').classList.add('hidden');
+      document.getElementById('rtdbUrlInput').value = (state.cloudConfig && state.cloudConfig.dbUrl) || '';
+      document.getElementById('rtdbSecretInput').value = (state.cloudConfig && state.cloudConfig.secret) || '';
+      document.getElementById('cloudConfigModal').classList.remove('hidden');
+    }
+
+    function closeCloudConfigModal() {
+      document.getElementById('cloudConfigModal').classList.add('hidden');
+    }
+
+    function saveCloudConfig(e) {
+      e.preventDefault();
+      if (!currentUser || currentUser.role !== 'admin') return;
+      state.cloudConfig = {
+        dbUrl: document.getElementById('rtdbUrlInput').value.trim(),
+        secret: document.getElementById('rtdbSecretInput').value.trim()
+      };
+      recordActivity(state.cloudConfig.dbUrl ? 'فعّل مزامنة Firebase Realtime Database' : 'حدّث إعدادات المزامنة السحابية');
+      persistState(true);
+      startFirebasePolling();
+      closeCloudConfigModal();
+      showToast('تم حفظ إعدادات المزامنة السحابية.', 'success');
+    }
+
+    function clearCloudConfig() {
+      if (!currentUser || currentUser.role !== 'admin') return;
+      state.cloudConfig = { dbUrl: '', secret: '' };
+      document.getElementById('rtdbUrlInput').value = '';
+      document.getElementById('rtdbSecretInput').value = '';
+      recordActivity('أوقف المزامنة السحابية الخارجية');
+      persistState(false);
+      startFirebasePolling();
+      closeCloudConfigModal();
+      showToast('تم إيقاف المزامنة السحابية.', 'info');
+    }
+
+    function exportToCSV() {
+      if (!hasPerm('exportData')) return;
+      document.getElementById('toolsMenu').classList.add('hidden');
+
+      const list = getFilteredMeters();
+      const headers = ['م', 'النوع', 'اسم العقار', 'مكان العداد - الموقع', 'اسم العميل / الشركة', 'رقم العداد', 'رقم الحساب', 'ملاحظات', 'عدد الفواتير', 'إجمالي الفواتير'];
+      const lines = list.map((m, idx) => {
+        const mBills = state.bills.filter(b => b.meterId === m.id);
+        const sum = mBills.reduce((s, b) => s + (parseFloat(b.amount) || 0), 0);
+        return [
+          idx + 1,
+          csvCell(m.type),
+          csvCell(m.property),
+          csvCell(m.location),
+          csvCell(normalizeClient(m.client)),
+          csvCell(m.meterNo),
+          csvCell('\t' + String(m.accountNo || '')),
+          csvCell(m.notes),
+          mBills.length,
+          sum
+        ].join(',');
+      });
+
+      const csv = '\uFEFF' + headers.map(csvCell).join(',') + '\n' + lines.join('\n');
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `تطبيق_العدادات_${new Date().toISOString().slice(0, 10)}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      showToast('تم تصدير ملف Excel بنجاح.', 'success');
+    }
+
+    function csvCell(val) {
+      const str = String(val === undefined || val === null ? '' : val);
+      return `"${str.replace(/"/g, '""')}"`;
+    }
+
+    function exportBackupJSON() {
+      if (!currentUser || currentUser.role !== 'admin') return;
+      document.getElementById('toolsMenu').classList.add('hidden');
+      const safe = cloneState(state);
+      safe.cloudConfig = { dbUrl: '', secret: '' };
+      const blob = new Blob([JSON.stringify(safe, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `نسخة_احتياطية_العدادات_${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      showToast('تم تحميل النسخة الاحتياطية.', 'success');
+    }
+
+    function triggerRestoreJSON() {
+      document.getElementById('toolsMenu').classList.add('hidden');
+      document.getElementById('restoreJsonInput').click();
+    }
+
+    function handleRestoreJSON(e) {
+      const file = e.target.files && e.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        try {
+          const parsed = JSON.parse(reader.result);
+          if (!parsed || !Array.isArray(parsed.meters)) {
+            showToast('ملف النسخة الاحتياطية غير صالح.', 'error');
+            return;
+          }
+          openConfirm('استعادة نسخة احتياطية', 'سيتم استبدال البيانات الحالية بالبيانات الموجودة في الملف. هل تريد المتابعة؟', () => {
+            const def = createDefaultState();
+            state = {
+              updatedAt: Date.now(),
+              sourceClient: CLIENT_ID,
+              admin: {
+                username: (parsed.admin && parsed.admin.username) || state.admin.username || def.admin.username,
+                password: (parsed.admin && parsed.admin.password) || state.admin.password || def.admin.password,
+                fullName: (parsed.admin && parsed.admin.fullName) || state.admin.fullName || def.admin.fullName
+              },
+              cloudConfig: state.cloudConfig,
+              meters: parsed.meters,
+              bills: Array.isArray(parsed.bills) ? parsed.bills : [],
+              employees: Array.isArray(parsed.employees)
+                ? parsed.employees.map(emp => ({ ...emp, permissions: normalizePermissions(emp.permissions) }))
+                : [],
+              presence: parsed.presence && typeof parsed.presence === 'object' ? parsed.presence : {},
+              activityLog: Array.isArray(parsed.activityLog) ? parsed.activityLog : []
+            };
+            recordActivity('استعاد نسخة احتياطية من ملف JSON');
+            persistState(true);
+            renderAll();
+            showToast('تمت استعادة النسخة الاحتياطية بنجاح.', 'success');
+          });
+        } catch (err) {
+          showToast('تعذر قراءة ملف JSON.', 'error');
+        } finally {
+          e.target.value = '';
+        }
+      };
+      reader.readAsText(file);
+    }
+
+    function printCurrentView() {
+      document.getElementById('toolsMenu').classList.add('hidden');
+      const filtered = getFilteredMeters();
+      const parts = [];
+      const client = document.getElementById('clientFilter').value;
+      const type = document.getElementById('typeFilter').value;
+      const status = document.getElementById('statusFilter').value;
+      if (client !== 'ALL') parts.push(`الشركة: ${client}`);
+      if (type !== 'ALL') parts.push(`النوع: ${type}`);
+      if (status !== 'ALL') parts.push(`حالة الفواتير: ${status}`);
+
+      document.getElementById('printScopeText').textContent = parts.length ? parts.join(' — ') : 'تقرير شامل لجميع العدادات';
+      document.getElementById('printDateText').textContent = new Date().toLocaleDateString('ar-SA');
+      document.getElementById('printCountText').textContent = filtered.length;
+      window.print();
+    }
+
+    /* =====================================================================
+       10. CONFIRM MODAL, TOASTS, ESCAPING & SAFE BOOTSTRAP
+       ===================================================================== */
+    function openConfirm(title, message, onOk) {
+      document.getElementById('confirmTitle').textContent = title;
+      document.getElementById('confirmMessage').textContent = message;
+      confirmCallback = onOk;
+      document.getElementById('confirmModal').classList.remove('hidden');
+    }
+
+    function closeConfirmModal() {
+      confirmCallback = null;
+      document.getElementById('confirmModal').classList.add('hidden');
+    }
+
+    document.getElementById('confirmOkBtn').addEventListener('click', () => {
+      const fn = confirmCallback;
+      closeConfirmModal();
+      if (typeof fn === 'function') fn();
+    });
+
+    function copyValue(text) {
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+        showToast(`تم النسخ: ${text}`, 'info');
+      } catch (e) {}
+    }
+
+    function showToast(msg, type = 'info') {
+      try {
+        const box = document.getElementById('toastContainer');
+        const el = document.createElement('div');
+        el.className = `toast toast-${type}`;
+        el.textContent = msg;
+        box.appendChild(el);
+        setTimeout(() => {
+          if (el.parentNode) el.parentNode.removeChild(el);
+        }, 3000);
+      } catch (e) {}
+    }
+
+    function escapeHtml(v) {
+      return String(v === null || v === undefined ? '' : v)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    function escapeAttr(v) {
+      return escapeHtml(v).replace(/`/g, '&#96;');
+    }
+
+    function bootApp() {
+      try {
+        state = loadStateFromStorage();
+        setupLiveListeners();
+
+        let savedSession = null;
+        try {
+          const rawSession = sessionStorage.getItem(SESSION_KEY);
+          if (rawSession) savedSession = JSON.parse(rawSession);
+        } catch (e) {}
+
+        if (savedSession && savedSession.role === 'admin') {
+          enterWorkspace({
+            id: 'admin',
+            fullName: state.admin.fullName || 'المدير العام',
+            username: state.admin.username,
+            role: 'admin',
+            permissions: {
+              view: true,
+              addMeter: true,
+              editMeter: true,
+              deleteMeter: true,
+              manageInvoices: true,
+              deleteInvoice: true,
+              exportData: true
+            }
+          }, false);
+        } else if (savedSession && savedSession.role === 'employee') {
+          const emp = state.employees.find(item => item.id === savedSession.id && item.active);
+          if (emp) {
+            enterWorkspace({
+              id: emp.id,
+              fullName: emp.fullName,
+              username: emp.username,
+              role: 'employee',
+              permissions: normalizePermissions(emp.permissions)
+            }, false);
+          } else {
+            document.getElementById('loginScreen').classList.remove('hidden');
+          }
+        } else {
+          document.getElementById('loginScreen').classList.remove('hidden');
+        }
+      } catch (err) {
+        try {
+          document.getElementById('loginScreen').classList.remove('hidden');
+        } catch (e) {}
+      }
+    }
+
+    bootApp();
+  </script>
+</body>
+</html>
