@@ -2290,60 +2290,140 @@
       inp.type = inp.type === 'password' ? 'text' : 'password';
     }
 
-    function handleLogin(e) {
-      e.preventDefault();
-      try {
-        const u = document.getElementById('loginUsername').value.trim();
-        const p = document.getElementById('loginPassword').value;
-        const errBox = document.getElementById('loginErrorBox');
-        const errText = document.getElementById('loginErrorText');
-        errBox.classList.add('hidden');
+ async function handleLogin(e) {
+  e.preventDefault();
+  try {
+    const u = document.getElementById('loginUsername').value.trim();
+    const p = document.getElementById('loginPassword').value;
+    const errBox = document.getElementById('loginErrorBox');
+    const errText = document.getElementById('loginErrorText');
+    errBox.classList.add('hidden');
 
-        if (u.toLowerCase() === String(state.admin.username).toLowerCase() && p === String(state.admin.password)) {
-          enterWorkspace({
-            id: 'admin',
-            fullName: state.admin.fullName || 'المدير العام',
-            username: state.admin.username,
-            role: 'admin',
-            permissions: {
-              view: true,
-              addMeter: true,
-              editMeter: true,
-              deleteMeter: true,
-              manageInvoices: true,
-              deleteInvoice: true,
-              exportData: true
-            }
-          }, true);
-          return;
-        }
-
-        const emp = state.employees.find(
-          item => String(item.username).toLowerCase() === u.toLowerCase() && String(item.password) === p
-        );
-
-        if (emp) {
-          if (!emp.active) {
-            errText.textContent = 'هذا الحساب موقوف حالياً. يرجى مراجعة المدير.';
-            errBox.classList.remove('hidden');
-            return;
-          }
-          enterWorkspace({
-            id: emp.id,
-            fullName: emp.fullName,
-            username: emp.username,
-            role: 'employee',
-            permissions: normalizePermissions(emp.permissions)
-          }, true);
-          return;
-        }
-
-        errText.textContent = 'اسم المستخدم أو كلمة المرور غير صحيحة.';
-        errBox.classList.remove('hidden');
-      } catch (err) {
-        showToast('حدث خطأ أثناء تسجيل الدخول.', 'error');
-      }
+    if (!u || !p) {
+      errText.textContent = 'يرجى إدخال اسم المستخدم وكلمة المرور.';
+      errBox.classList.remove('hidden');
+      return;
     }
+
+    // 1) دخول المدير
+    if (
+      state.admin &&
+      u.toLowerCase() === String(state.admin.username || '').toLowerCase() &&
+      p === String(state.admin.password || '')
+    ) {
+      enterWorkspace({
+        id: 'admin',
+        fullName: state.admin.fullName || 'المدير العام',
+        username: state.admin.username,
+        role: 'admin',
+        permissions: {
+          view: true,
+          addMeter: true,
+          editMeter: true,
+          deleteMeter: true,
+          manageInvoices: true,
+          deleteInvoice: true,
+          exportData: true
+        }
+      }, true);
+      return;
+    }
+
+    // 2) جلب أحدث بيانات الموظفين من Firebase إذا كانت متاحة
+    let employeesList = Array.isArray(state.employees) ? [...state.employees] : [];
+    try {
+      if (typeof window.firebaseDb !== 'undefined' && window.firebaseDb) {
+        const snap = await window.firebaseDb.ref('tatbeeq_al_addadat/employees').once('value');
+        const cloudEmps = snap.val();
+        if (cloudEmps) {
+          employeesList = Array.isArray(cloudEmps)
+            ? cloudEmps.filter(Boolean)
+            : Object.values(cloudEmps).filter(Boolean);
+          state.employees = employeesList;
+        }
+      }
+    } catch (cloudErr) {
+      console.warn('تعذر قراءة الموظفين من Firebase مباشرة، سيتم استخدام البيانات المحلية:', cloudErr);
+    }
+
+    // 3) البحث عن الموظف والتحقق من بياناته وحالة حسابه
+    const emp = employeesList.find(
+      item =>
+        item &&
+        String(item.username || '').trim().toLowerCase() === u.toLowerCase() &&
+        String(item.password || '') === p
+    );
+
+    if (!emp) {
+      errText.textContent = 'اسم المستخدم أو كلمة المرور غير صحيحة.';
+      errBox.classList.remove('hidden');
+      return;
+    }
+
+    if (emp.active === false || String(emp.active) === 'false') {
+      errText.textContent = 'هذا الحساب موقوف حالياً. يرجى مراجعة المدير.';
+      errBox.classList.remove('hidden');
+      return;
+    }
+
+    const empPermissions =
+      typeof normalizePermissions === 'function'
+        ? normalizePermissions(emp.permissions)
+        : (emp.permissions || {});
+
+    // 4) الدخول الفوري للموظف بصلاحياته
+    enterWorkspace({
+      id: emp.id,
+      fullName: emp.fullName || emp.username,
+      username: emp.username,
+      role: 'employee',
+      permissions: empPermissions
+    }, true);
+
+    // 5) متابعة فورية لصلاحيات وحالة الموظف عند أي تعديل من المدير
+    if (typeof window.firebaseDb !== 'undefined' && window.firebaseDb && emp.id) {
+      window.firebaseDb.ref('tatbeeq_al_addadat/employees').on('value', (snapshot) => {
+        const val = snapshot.val();
+        if (!val) return;
+        const latestList = Array.isArray(val)
+          ? val.filter(Boolean)
+          : Object.values(val).filter(Boolean);
+        state.employees = latestList;
+
+        const updatedEmp = latestList.find(item => item && item.id === emp.id);
+        if (!updatedEmp || updatedEmp.active === false || String(updatedEmp.active) === 'false') {
+          if (typeof showToast === 'function') {
+            showToast('تم إيقاف حسابك أو حذفه من قبل المدير.', 'error');
+          }
+          if (typeof handleLogout === 'function') {
+            handleLogout(true);
+          }
+          return;
+        }
+
+        if (typeof currentUser !== 'undefined' && currentUser && currentUser.role === 'employee') {
+          currentUser.fullName = updatedEmp.fullName || currentUser.fullName;
+          currentUser.permissions =
+            typeof normalizePermissions === 'function'
+              ? normalizePermissions(updatedEmp.permissions)
+              : (updatedEmp.permissions || currentUser.permissions);
+
+          const roleEl = document.getElementById('currentUserRole');
+          const nameEl = document.getElementById('currentUserName');
+          if (nameEl) nameEl.textContent = currentUser.fullName;
+          if (roleEl) roleEl.textContent = `موظف (${currentUser.username}) • نشط الآن`;
+
+          if (typeof applyPermissionsToUI === 'function') applyPermissionsToUI();
+          if (typeof renderAll === 'function') renderAll();
+        }
+      });
+    }
+  } catch (err) {
+    if (typeof showToast === 'function') {
+      showToast('حدث خطأ أثناء تسجيل الدخول.', 'error');
+    }
+  }
+}
 
     function enterWorkspace(userObj, showWelcome) {
       currentUser = userObj;
